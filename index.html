@@ -2977,6 +2977,66 @@ const local = { logout: ACT.logout, deleteAccount: ACT.deleteAccount };
 const validEmail = e => /^\S+@\S+\.\S+$/.test(e);
 A = { user: null, in: false }; applyProfile();
 
+/* ---- Your shelf, copies and custom books live in Supabase while you're logged in ---- */
+let cloud = false, snap = null, timer = null, running = false, again = false, warned = false;
+const EMPTY = () => ({ v: 1, friends: [], friendRequests: [], sentRequests: [], library: {}, shelves: [], copies: [], loans: [], convos: [] });
+const isUuid = s => /^[0-9a-f]{8}-[0-9a-f]{4}-/.test(s);
+const toDb = s => (s === 'finished' ? 'read' : s), fromDb = s => (s === 'read' ? 'finished' : s);
+const mapJ = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, JSON.stringify(v)]));
+const dropCustomBooks = () => { for (const id of Object.keys(S.customBooks || {})) delete BOOKS[id]; };
+
+function rows() {
+  const uidA = A.user.id, shelf = {}, copies = {}, books = {};
+  Object.entries(S.library).forEach(([id, e]) => { shelf[id] = { user_id: uidA, book_id: id, status: toDb(e.status), rating: e.rating || null, fav: !!e.fav, shelves: e.shelves || [], added: new Date(e.added || Date.now()).toISOString() }; });
+  S.copies.filter(c => c.owner === 'me').forEach(c => { copies[c.id] = { id: c.id, owner: uidA, book_id: c.book, lendable: !!c.lendable, cond: c.cond || 'Good', note: c.note || '' }; });
+  Object.values(S.customBooks || {}).forEach(b => { books[b.id] = { id: b.id, title: b.title, author: b.author, year: b.year, genre: b.genre, description: b.desc, cover: b.cover, created_by: uidA }; });
+  return { shelf, copies, books, shelves: JSON.stringify(S.shelves) };
+}
+const toSnap = r => ({ shelf: mapJ(r.shelf), copies: mapJ(r.copies), books: mapJ(r.books), shelves: r.shelves });
+
+async function pullData(id) {
+  const [sh, cp, bk, pr] = await Promise.all([
+    sb.from('shelf').select('*').eq('user_id', id), sb.from('copies').select('*').eq('owner', id),
+    sb.from('books').select('*').eq('created_by', id), sb.from('profiles').select('shelves').eq('id', id).single()]);
+  const err = sh.error || cp.error || bk.error || pr.error; if (err) throw err;
+  dropCustomBooks(); S = EMPTY(); S.customBooks = {};
+  bk.data.forEach(r => { const b = { id: r.id, title: r.title, author: r.author, year: r.year, genre: r.genre, desc: r.description, rating: 0, ratings: 0, cover: r.cover }; S.customBooks[r.id] = b; BOOKS[r.id] = b; });
+  sh.data.filter(r => BOOKS[r.book_id]).forEach(r => { S.library[r.book_id] = { status: fromDb(r.status), rating: r.rating || 0, fav: r.fav, shelves: r.shelves || [], added: Date.parse(r.added) || Date.now() }; });
+  cp.data.filter(r => BOOKS[r.book_id]).forEach(r => S.copies.push({ id: r.id, book: r.book_id, owner: 'me', lendable: r.lendable, cond: r.cond || 'Good', note: r.note || '' }));
+  S.shelves = pr.data.shelves || [];
+  cloud = true; snap = toSnap(rows());
+}
+
+const chk = async p => { const { error } = await p; if (error) throw error; };
+async function sync() {
+  if (!cloud || !A.user) return;
+  if (running) { again = true; return; }
+  running = true;
+  try {
+    const r = rows(), ns = toSnap(r), me = A.user.id;
+    const changed = t => Object.keys(ns[t]).filter(k => ns[t][k] !== snap[t][k]).map(k => r[t][k]);
+    const gone = t => Object.keys(snap[t]).filter(k => !(k in ns[t]));
+    const ops = [], b = changed('books'), s = changed('shelf'), c = changed('copies'), gs = gone('shelf'), gc = gone('copies');
+    if (b.length) ops.push(chk(sb.from('books').upsert(b)));
+    if (s.length) ops.push(chk(sb.from('shelf').upsert(s, { onConflict: 'user_id,book_id' })));
+    if (c.length) ops.push(chk(sb.from('copies').upsert(c)));
+    if (gs.length) ops.push(chk(sb.from('shelf').delete().eq('user_id', me).in('book_id', gs)));
+    if (gc.length) ops.push(chk(sb.from('copies').delete().eq('owner', me).in('id', gc)));
+    if (ns.shelves !== snap.shelves) ops.push(chk(sb.from('profiles').update({ shelves: S.shelves }).eq('id', me)));
+    await Promise.all(ops);
+    snap = ns; warned = false;
+  } catch (e) {
+    if (!warned) { warned = true; toast('Couldn\'t save your latest changes. Retrying...'); }
+    clearTimeout(timer); timer = setTimeout(sync, 5000);
+  }
+  running = false; if (again) { again = false; sync(); }
+}
+const saveBase = save;
+save = function () { if (cloud) { clearTimeout(timer); timer = setTimeout(sync, 700); } else saveBase(); };
+const addCopyBase = addMyCopy;
+addMyCopy = (bookId, lendable) => { addCopyBase(bookId, lendable); const c = myCopy(bookId); if (cloud && c && !isUuid(c.id)) c.id = crypto.randomUUID(); };
+function leaveCloud() { cloud = false; clearTimeout(timer); dropCustomBooks(); S = loadState(); }
+
 async function loadProfile(user) {
   const { data, error } = await sb.from('profiles').select('*').eq('id', user.id).single();
   if (error || !data) throw error || new Error('Profile not found');
@@ -2984,6 +3044,7 @@ async function loadProfile(user) {
   const prefs = old && old.user && old.user.id === user.id && old.user.prefs ? old.user.prefs : Object.assign({}, DEF_PREFS);
   A = { in: true, user: { id: user.id, email: user.email, name: data.name, bio: data.bio || '', hood: data.hood || 'maple', color: data.color || AV_COLORS[0], prefs } };
   saveA(); applyProfile();
+  await pullData(user.id);
 }
 
 ACT.authSubmit = async () => {
@@ -3007,14 +3068,14 @@ ACT.saveProfile = async () => {
   if (error) { toast('Couldn\'t save your profile. Try again.'); return; }
   Object.assign(A.user, row); UI.sheet = null; saveA(); applyProfile(); done('Profile updated');
 };
-ACT.logout = async () => { if (A.user && A.user.id) await sb.auth.signOut(); local.logout(); };
+ACT.logout = async () => { if (A.user && A.user.id) { await sync(); await sb.auth.signOut(); } leaveCloud(); local.logout(); };
 ACT.deleteAccount = async () => {
   if (A.user && A.user.id) {
     const { error } = await sb.rpc('delete_my_account');
     if (error) { toast('Couldn\'t delete the account. Try again.'); return; }
     await sb.auth.signOut();
   }
-  local.deleteAccount();
+  leaveCloud(); local.deleteAccount();
 };
 ACT.forgot = async () => {
   const email = AUTH.email.trim().toLowerCase();
